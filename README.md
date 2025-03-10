@@ -1,5 +1,11 @@
 
-# nanoGPT
+# nanoGPT-imm
+
+## To test the IMM
+
+```bash
+copy model-imm.py model.py
+```
 
 ![nanoGPT](assets/nanogpt.jpg)
 
