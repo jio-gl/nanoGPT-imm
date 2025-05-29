@@ -156,63 +156,75 @@ class LinformerMemory(nn.Module):
     Low-rank Implicit Memory Module (IMM) using Linformer-style attention for scalable memory retrieval.
     Reduces computational complexity from O(n_embd²) to O(n_embd * k), where k is the low-rank projection.
     """
-    def __init__(self, config, num_slots=None, low_rank_k=128):
+    def __init__(self, config):
         super().__init__()
         self.n_embd = config.n_embd
-        self.num_slots = num_slots if num_slots else int(math.sqrt(self.n_embd))  # Scales dynamically
-        self.low_rank_k = low_rank_k  # Defines rank of the projection
+        self.num_slots = config.memory_slots
+        self.memory = nn.Parameter(torch.zeros(self.num_slots, self.n_embd))
+        self.memory_mask = nn.Parameter(torch.ones(self.num_slots))
+        self.temperature = nn.Parameter(torch.ones(1))
+        self.mha_proj = nn.Linear(self.n_embd, self.n_embd)
+        self.context_proj = nn.Linear(self.num_slots, self.n_embd)
+        self.reset_memory()
 
-        # Memory projection (low-rank)
-        self.memory_proj = nn.Linear(self.n_embd, self.low_rank_k, bias=False)
+    def reset_memory(self):
+        with torch.no_grad():
+            # Initialize with smaller values for better stability
+            self.memory.data = torch.randn(self.num_slots, self.n_embd) * 0.01
+            self.memory_mask.data = torch.ones(self.num_slots)
+            self.temperature.data = torch.ones(1)
 
-        # Linear layers for query, key, value
-        self.write_layer = nn.Linear(self.n_embd, self.n_embd)  # Memory write
-        self.query_layer = nn.Linear(self.n_embd, self.low_rank_k)  # Low-rank Query
-        self.value_layer = nn.Linear(self.n_embd, self.n_embd)  # Values remain full-dimension
-
-        # Attention dropout and scaling
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.scale = 1.0 / math.sqrt(self.low_rank_k)
-
-        # Memory bank (initialized empty and updated per batch)
-        self.register_buffer("memory", torch.zeros(self.num_slots, self.n_embd))
-
-    def reset_memory(self, batch_size, device):
-        """ Initializes memory bank for each batch """
-        self.memory = torch.zeros(batch_size, self.num_slots, self.n_embd, device=device)
-
-    def forward(self, x):
-        """
-        Forward pass:
-        1. Write memory: Summarize sequence into memory slots
-        2. Compress memory using low-rank projection
-        3. Query memory in compressed space
-        4. Retrieve values in full space
-        """
-        batch_size, seq_len, _ = x.shape
-
-        # (1) Write to memory using mean-pooling summarization
-        s = self.write_layer(x)  # (batch, seq_len, n_embd)
-        s_avg = s.mean(dim=1, keepdim=True)  # (batch, 1, n_embd)
-        mem = self.memory.clone()  # (batch, num_slots, n_embd)
-        mem[:, 0, :] = s_avg.squeeze(1)  # Store summary in first slot
-
-        # (2) Project memory into low-rank space
-        mem_low_rank = self.memory_proj(mem)  # (batch, num_slots, low_rank_k)
-
-        # (3) Compute query in low-rank space
-        q = self.query_layer(x)  # (batch, seq_len, low_rank_k)
+    def update_memory(self, x):
+        # x: [batch, seq_len, n_embd]
+        # Normalize input for better stability
+        x_norm = F.normalize(x, dim=-1)
+        memory_norm = F.normalize(self.memory, dim=-1)
         
-        # (4) Compute attention in compressed space
-        att = torch.matmul(q, mem_low_rank.transpose(1, 2)) * self.scale  # (batch, seq_len, num_slots)
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
+        # Compute attention scores with proper scaling
+        attn_scores = torch.matmul(x_norm, memory_norm.t())  # [batch, seq_len, num_slots]
+        attn_scores = attn_scores / (self.n_embd ** 0.5)  # Scale by sqrt(d_k)
+        attn_scores = attn_scores / self.temperature  # Apply temperature scaling
+        
+        # Add small epsilon before softmax for numerical stability
+        attn_scores = attn_scores + 1e-8
+        attn_scores = F.softmax(attn_scores, dim=-1)  # [batch, seq_len, num_slots]
+        
+        # Compute memory update with proper scaling
+        memory_update = torch.matmul(attn_scores.transpose(1, 2), x_norm)  # [batch, num_slots, n_embd]
+        memory_update = memory_update.sum(dim=0)  # [num_slots, n_embd]
+        
+        # Normalize memory update
+        memory_update = F.normalize(memory_update, dim=-1)
+        
+        # Adaptive learning rate based on update magnitude
+        update_norm = torch.norm(memory_update, dim=-1, keepdim=True)
+        lr = 0.01 / (1.0 + update_norm)  # Smaller updates for larger magnitudes
+        
+        # Update memory with adaptive learning rate
+        self.memory.data = self.memory.data + lr * memory_update
+        
+        # Normalize memory after update
+        self.memory.data = F.normalize(self.memory.data, dim=-1)
+        
+        # Ensure no nan values
+        if torch.isnan(self.memory.data).any():
+            print("[WARNING] NaN values detected in memory update. Resetting memory.")
+            self.reset_memory()
 
-        # (5) Retrieve memory values in full space
-        v = self.value_layer(mem)  # (batch, num_slots, n_embd)
-        r = torch.matmul(att, v)  # (batch, seq_len, n_embd)
-
-        return r
+    def forward(self, x, update_memory=True):
+        # x: [batch, seq_len, n_embd]
+        if update_memory:
+            self.update_memory(x)
+            
+        # Normalize input for better stability
+        x_norm = F.normalize(x, dim=-1)
+        memory_norm = F.normalize(self.memory, dim=-1)
+        
+        # Compute memory context with normalized vectors
+        context = torch.matmul(x_norm, memory_norm.t())  # [batch, seq_len, num_slots]
+        context = self.context_proj(context)  # [batch, seq_len, n_embd]
+        
+        return context
 
 
 @dataclass
@@ -224,6 +236,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True
+    memory_slots: int = 8  # Added memory_slots parameter with default value
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -242,8 +255,7 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
         # Initialize the Implicit Memory Module (IMM)
-        #self.imm = ImplicitMemory(config, num_slots=48)
-        self.imm = LinformerMemory(config, num_slots=int(math.sqrt(config.n_embd)), low_rank_k=128)
+        self.imm = LinformerMemory(config)  # Use LinformerMemory by default
 
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
@@ -265,7 +277,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, update_memory=True, logits=None, return_hidden_states=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -273,21 +285,33 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx)
         pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
-        # Reset IMM memory for current batch
-        self.imm.reset_memory(b, device)
-        # Process through Transformer blocks and integrate IMM output after each block.
-        for block in self.transformer.h:
+        
+        # Process through Transformer blocks and integrate IMM output after each block
+        for i, block in enumerate(self.transformer.h):
             x = block(x)
-            r = self.imm(x)
-            # Integrate IMM output with a residual connection and layer normalization.
-            x = LayerNorm(self.config.n_embd, bias=self.config.bias)(x + r)
+            # Get IMM output and integrate it
+            if targets is not None and update_memory:
+                # Get logits for memory update if not provided
+                if logits is None:
+                    block_logits = self.lm_head(x)
+                else:
+                    block_logits = logits
+                # Update memory more frequently in later layers
+                should_update = (i >= len(self.transformer.h) // 2) if update_memory else False
+                r = self.imm(x, update_memory=should_update)
+            else:
+                r = self.imm(x, update_memory=update_memory)
+            x = x + r  # Simple residual connection
         x = self.transformer.ln_f(x)
+        
         if targets is not None:
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
+        if return_hidden_states:
+            return logits, loss, x
         return logits, loss
 
     def crop_block_size(self, block_size):
@@ -324,10 +348,11 @@ class GPT(nn.Module):
             config_args['dropout'] = override_args['dropout']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
-        model = GPT(config)
+        model = cls(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+        sd_keys = [k for k in sd_keys if not k.startswith('imm.')] # exclude IMM-specific parameters
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
@@ -352,6 +377,9 @@ class GPT(nn.Module):
                 assert sd_hf[k].shape == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
+
+        # Initialize IMM-specific parameters
+        model.imm.reset_memory()  # Initialize with batch size 1
 
         return model
 

@@ -1,4 +1,3 @@
-
 # nanoGPT-imm
 
 ## To test the IMM
@@ -231,3 +230,81 @@ For more questions/discussions feel free to stop by **#nanoGPT** on Discord:
 ## acknowledgements
 
 All nanoGPT experiments are powered by GPUs on [Lambda labs](https://lambdalabs.com), my favorite Cloud GPU provider. Thank you Lambda labs for sponsoring nanoGPT!
+
+## IMM Benchmark
+
+The repository includes a benchmark to measure the effectiveness of the Implicit Memory Module (IMM) on both Shakespeare and modern text. This helps understand how well the memory mechanism helps with remembering context and handling different types of text.
+
+### Preparing the Modern Text Dataset
+
+First, prepare the modern text dataset that will be combined with Shakespeare:
+
+```bash
+python prepare_modern_text.py
+```
+
+This script:
+1. Fetches modern texts from Project Gutenberg
+2. Cleans and processes the text
+3. Encodes it using the same encoding as the Shakespeare dataset
+4. Creates train/val splits
+5. Saves the processed data in binary format
+
+### Running the Benchmark
+
+To run the benchmark:
+
+```bash
+python benchmark_imm.py
+```
+
+The benchmark measures:
+1. Memory effectiveness with different context lengths (32 to 256 tokens)
+2. Performance comparison between modern and Shakespeare text
+3. Scaling behavior with increasing sequence lengths
+
+Results are logged to Weights & Biases and saved as plots in `benchmark_results.png`.
+
+### Scaling to Larger Models
+
+The IMM implementation can be scaled to larger models by:
+1. Adjusting memory slots based on model size
+2. Using distributed memory across multiple GPUs
+3. Implementing efficient memory update strategies
+4. Optimizing memory bandwidth usage
+
+Example configuration for larger models:
+```python
+memory_config = {
+    'num_slots': int(math.sqrt(model_size)),  # Scale with model size
+    'low_rank_k': min(128, model_size // 8),  # Adaptive low-rank projection
+    'memory_bank_size': model_size // 4  # Scale memory bank with model
+}
+```
+
+## Parallelism and Performance
+
+Both the standard GPT and IMM implementations support full parallelism during training and inference:
+
+### Standard GPT
+- Supports Flash Attention (PyTorch >= 2.0) for efficient parallel computation
+- Implements multi-head attention with parallel processing
+- Uses efficient matrix operations that can be parallelized on GPU
+- Supports gradient accumulation and distributed training
+- Processes sequences in parallel within the batch dimension
+
+### IMM Implementation
+The Implicit Memory Module maintains parallelism while adding memory operations:
+
+1. Basic ImplicitMemory:
+   - Parallel write operations across the batch
+   - Parallel memory operations within batch dimension
+   - Parallel read operations using attention mechanisms
+
+2. LinformerMemory (Optimized):
+   - Uses low-rank projections to reduce computational complexity (O(n_embd * k) instead of O(n_embd²))
+   - Maintains parallel operations in compressed space
+   - Memory-efficient while preserving parallelism
+   - Optimized for both training and inference
+
+Both implementations are production-ready and support full GPU acceleration. The IMM version specifically optimizes memory operations while maintaining parallel processing capabilities.
